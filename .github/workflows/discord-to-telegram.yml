@@ -1,0 +1,97 @@
+name: Discord photos and videos to Telegram topics
+
+on:
+  schedule:
+    - cron: '3-59/10 * * * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Run the router or only its automated tests
+        type: choice
+        options:
+          - sync
+          - tests
+        default: sync
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/discord-to-telegram.yml'
+      - 'DiscordTelegramMediaRouter/**.py'
+      - 'DiscordTelegramMediaRouter/requirements.txt'
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: discord-telegram-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  tests:
+    name: Check media routing
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    defaults:
+      run:
+        working-directory: DiscordTelegramMediaRouter
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: python -m pip install -r requirements.txt
+      - run: python -m unittest discover -s tests -v
+
+  sync:
+    name: Forward new Discord photos and videos
+    needs: tests
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'schedule' ||
+       (github.event_name == 'workflow_dispatch' && inputs.mode == 'sync'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    defaults:
+      run:
+        working-directory: DiscordTelegramMediaRouter
+    env:
+      DISCORD_GUILD_ID: '987533334894772284'
+      DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID }}
+      TELEGRAM_OWNER_USER_ID: ${{ secrets.TELEGRAM_OWNER_USER_ID }}
+      ROUTER_CONFIG_JSON: ${{ secrets.ROUTER_CONFIG_JSON }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: python -m pip install -r requirements.txt
+      - name: Register Telegram topics and forward Discord media
+        run: python media_router.py
+      - name: Save forwarding progress even after a partial failure
+        if: ${{ always() && !cancelled() }}
+        working-directory: .
+        run: |
+          set -euo pipefail
+          if [[ ! -d .git ]]; then
+            exit 0
+          fi
+          if [[ ! -f DiscordTelegramMediaRouter/router_state.enc ]]; then
+            exit 0
+          fi
+          git add -- DiscordTelegramMediaRouter/router_state.enc
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'Save Discord-to-Telegram forwarding progress'
+          git pull --rebase origin main
+          git push origin HEAD:main
