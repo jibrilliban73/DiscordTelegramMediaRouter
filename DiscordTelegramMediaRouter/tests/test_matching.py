@@ -21,6 +21,10 @@ class RoutingTests(unittest.TestCase):
         self.assertIsNone(match_topic("finance", self.topics)[0])
         self.assertIsNone(match_topic("WTJ", {"100": {"name": "WTJ Photos"}, "101": {"name": "WTJ Videos"}})[0])
 
+    def test_empty_or_emoji_only_names_are_not_a_match(self):
+        self.assertIsNone(match_topic("✨", {"100": {"name": "🎉"}})[0])
+        self.assertIsNone(match_topic("", self.topics)[0])
+
     def test_media(self):
         message = {"attachments": [
             {"filename": "a.png", "content_type": "image/png"},
