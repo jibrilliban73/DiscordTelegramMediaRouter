@@ -7,20 +7,25 @@ Uses Discord Bot API and Telegram Bot API (not a user account/self-bot).
 from __future__ import annotations
 
 import difflib
+import base64
+import hashlib
 import io
 import json
+import mimetypes
 import os
 import re
 import sys
 import time
 import unicodedata
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 import requests
+from cryptography.fernet import Fernet, InvalidToken
 
 DISCORD_API = "https://discord.com/api/v10"
 TELEGRAM_API = "https://api.telegram.org"
-STATE_FILE = Path(__file__).with_name("router_state.json")
+STATE_FILE = Path(__file__).with_name("router_state.enc")
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".heic", ".avif")
 VIDEO_EXTENSIONS = (".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi", ".wmv", ".mpeg", ".mpg", ".3gp")
 NOISE_WORDS = {"discord", "telegram", "tg", "channel", "topic", "photos", "photo", "pictures", "picture", "images", "image", "videos", "video", "media", "uploads", "updates", "clips", "posts"}
@@ -39,6 +44,10 @@ class TelegramHttpError(RuntimeError):
     def __init__(self, status_code: int, description: str):
         self.status_code = status_code
         super().__init__(f"Telegram HTTP {status_code}: {description}")
+
+
+class MediaTooLarge(ValueError):
+    """A media attachment cannot be uploaded through the hosted Bot API."""
 
 
 def api_request(method: str, url: str, *, params=None, data=None, files=None, json_body=None, timeout=40):
@@ -130,6 +139,8 @@ def match_topic(channel_name: str, topics: dict) -> tuple[str | None, str]:
     """
     if not topics:
         return None, "no topics registered"
+    if not normalize_name(channel_name):
+        return None, "channel name has no recognizable letters or digits"
     entries = [(str(topic_id), item["name"]) for topic_id, item in topics.items()]
     exact = [(topic_id, name) for topic_id, name in entries if normalize_name(name) == normalize_name(channel_name)]
     if len(exact) == 1:
@@ -153,8 +164,47 @@ def match_topic(channel_name: str, topics: dict) -> tuple[str | None, str]:
     if best[0] >= 0.89 and best[0] - runner_up >= 0.12:
         return best[1], f"close spelling ({best[0]:.0%})"
     if best[0] >= 0.70:
-        return None, f"possible topic '{best[2]}' ({best[0]:.0%}); not confident enough"
+        return None, f"possible topic ({best[0]:.0%}); not confident enough"
     return None, "no similar topic found"
+
+
+def load_routing_config() -> dict:
+    """Private topic inventory and explicit channel-ID overrides from a secret."""
+    raw = os.environ.get("ROUTER_CONFIG_JSON", "").strip()
+    if not raw:
+        return {"topics": {}, "channel_overrides": {}}
+    try:
+        config = json.loads(raw)
+    except (TypeError, ValueError):
+        raise RuntimeError("ROUTER_CONFIG_JSON must be a JSON object") from None
+    if not isinstance(config, dict):
+        raise RuntimeError("ROUTER_CONFIG_JSON must be a JSON object")
+    topics = config.get("topics", {})
+    overrides = config.get("channel_overrides", {})
+    if not isinstance(topics, dict) or not isinstance(overrides, dict):
+        raise RuntimeError("ROUTER_CONFIG_JSON topics and channel_overrides must be objects")
+    for tid, item in topics.items():
+        if not str(tid).isdigit() or int(tid) < 1 or not isinstance(item, dict) or not isinstance(item.get("name"), str) or not item["name"].strip():
+            raise RuntimeError("Each configured topic needs a positive topic ID and a name")
+    for cid, tid in overrides.items():
+        if not str(cid).isdigit() or not isinstance(tid, str) or not tid.isdigit() or int(tid) < 1:
+            raise RuntimeError("Channel overrides must map channel IDs to positive topic-ID strings")
+    return {**config, "topics": topics, "channel_overrides": overrides}
+
+
+def resolve_channel_route(channel: dict, topics: dict, overrides: dict) -> tuple[str | None, str]:
+    """Explicit IDs take priority, even when the channel is later renamed."""
+    target = overrides.get(str(channel["id"]))
+    if target is not None:
+        if target not in topics:
+            return None, "explicit destination is missing; automatic matching disabled for this channel"
+        return target, "explicit channel-to-topic mapping"
+    return match_topic(channel["name"], topics)
+
+
+def channel_label(channel: dict) -> str:
+    # This is a public repository: private channel/topic names stay out of logs.
+    return "channel " + hashlib.sha256(str(channel["id"]).encode()).hexdigest()[:10]
 
 
 def default_state() -> dict:
@@ -164,15 +214,33 @@ def default_state() -> dict:
 def load_state() -> dict:
     if not STATE_FILE.exists():
         return default_state()
-    state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    try:
+        state = json.loads(state_cipher().decrypt(STATE_FILE.read_bytes()))
+    except InvalidToken:
+        raise RuntimeError("Cannot decrypt forwarding state. Restore the original Telegram bot token before resuming; do not reset progress blindly") from None
     if state.get("version") != 1:
-        raise RuntimeError("Unexpected router_state.json format; do not reuse the old photo-only state.json")
+        raise RuntimeError("Unexpected forwarding-state format")
     return state
 
 
+def state_cipher() -> Fernet:
+    # Bot tokens are high-entropy credentials. Domain separation ensures that
+    # this key is used only for router state; no extra user-managed key is needed.
+    digest = hashlib.sha256(b"discord-telegram-state-v1:" + get_secret("TELEGRAM_BOT_TOKEN").encode()).digest()
+    return Fernet(base64.urlsafe_b64encode(digest))
+
+
 def save_state(state: dict):
+    cipher = state_cipher()
+    payload = json.dumps(state, sort_keys=True, ensure_ascii=False).encode()
+    if STATE_FILE.exists():
+        try:
+            if cipher.decrypt(STATE_FILE.read_bytes()) == payload:
+                return
+        except InvalidToken:
+            raise RuntimeError("Refusing to overwrite forwarding state encrypted with another bot token") from None
     tmp = STATE_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state, indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8")
+    tmp.write_bytes(cipher.encrypt(payload))
     tmp.replace(STATE_FILE)
 
 
@@ -246,15 +314,59 @@ def list_channels(token: str, guild_id: str) -> list[dict]:
 
 
 def media_attachments(message: dict) -> list[dict]:
+    """Uploads plus direct Discord-hosted media URLs; ordinary links are ignored."""
     found = []
+    seen = set()
+
+    def add(item):
+        url = item.get("url", "")
+        parts = urlsplit(url)
+        key = parts.path if parts.hostname in {"cdn.discordapp.com", "media.discordapp.net"} else url
+        if key and key in seen:
+            return
+        if key:
+            seen.add(key)
+        found.append(item)
+
     for item in message.get("attachments", []):
         name = (item.get("filename") or "").lower()
         mime = (item.get("content_type") or "").lower()
         if mime.startswith("image/") or name.endswith(IMAGE_EXTENSIONS):
-            found.append({**item, "_kind": "photo"})
+            add({**item, "_kind": "photo"})
         elif mime.startswith("video/") or name.endswith(VIDEO_EXTENSIONS):
-            found.append({**item, "_kind": "video"})
+            add({**item, "_kind": "video"})
+    urls = re.findall(r"https://(?:cdn\.discordapp\.com|media\.discordapp\.net)/(?:ephemeral-attachments|attachments)/[^\s<>\"']+", message.get("content") or "", re.I)
+    for embed in message.get("embeds", []):
+        urls.append(embed.get("url") or "")
+        for field in ("image", "video"):
+            urls.append((embed.get(field) or {}).get("url") or "")
+    for url in urls:
+        item = discord_media_url(url.rstrip(")]},.;"))
+        if item is not None:
+            add(item)
     return found
+
+
+def discord_media_url(url: str) -> dict | None:
+    """Only genuine attachment URLs on Discord's two media hosts qualify."""
+    try:
+        parts = urlsplit(url)
+        if parts.scheme != "https" or parts.hostname not in {"cdn.discordapp.com", "media.discordapp.net"} or parts.username or parts.password or parts.port not in (None, 443):
+            return None
+    except ValueError:
+        return None
+    if not re.fullmatch(r"/(?:ephemeral-attachments|attachments)/[0-9]+/[0-9]+/[^/]+", parts.path):
+        return None
+    filename = Path(unquote(parts.path.rsplit("/", 1)[-1])).name
+    lowered = filename.casefold()
+    if lowered.endswith(IMAGE_EXTENSIONS):
+        kind = "photo"
+    elif lowered.endswith(VIDEO_EXTENSIONS):
+        kind = "video"
+    else:
+        return None
+    mime = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    return {"url": parts._replace(fragment="").geturl(), "filename": filename, "content_type": mime, "_kind": kind}
 
 
 def get_new_messages(token: str, channel_id: str, last_message_id: str) -> list[dict]:
@@ -282,32 +394,29 @@ def get_new_messages(token: str, channel_id: str, last_message_id: str) -> list[
 
 
 def download_media(item: dict) -> bytes:
-    name = item.get("filename", "file")
     expected_size = int(item.get("size") or 0)
     if expected_size > MAX_BYTES:
-        raise ValueError(f"{name} is over the Telegram Bot API 50 MB upload limit")
-    with SESSION.get(item["url"], timeout=100, stream=True) as response:
-        response.raise_for_status()
-        data = io.BytesIO()
-        for chunk in response.iter_content(chunk_size=256 * 1024):
-            data.write(chunk)
-            if data.tell() > MAX_BYTES:
-                raise ValueError(f"{name} exceeds the 50 MB upload limit")
-        return data.getvalue()
+        raise MediaTooLarge("Media exceeds the hosted Telegram Bot API upload limit")
+    try:
+        with SESSION.get(item["url"], timeout=100, stream=True, allow_redirects=False) as response:
+            if 300 <= response.status_code < 400:
+                raise RuntimeError("Discord media redirected unexpectedly; no file or link was forwarded")
+            response.raise_for_status()
+            data = io.BytesIO()
+            for chunk in response.iter_content(chunk_size=256 * 1024):
+                data.write(chunk)
+                if data.tell() > MAX_BYTES:
+                    raise MediaTooLarge("Media exceeds the hosted Telegram Bot API upload limit")
+            return data.getvalue()
+    except requests.RequestException:
+        # Signed CDN URLs must not leak through public workflow error logs.
+        raise RuntimeError("Discord media download failed; a copied media URL may have expired") from None
 
 
-def send_media(token: str, group_id: str, topic_id: str, item: dict, *, discord_link: str = ""):
-    # Telegram's cloud Bot API cannot upload video/files over 50 MB.
-    # Post an actionable Discord link rather than repeatedly blocking the queue.
+def send_media(token: str, group_id: str, topic_id: str, item: dict):
+    # Forward actual media files only. Never substitute a source URL or text.
     if int(item.get("size") or 0) > MAX_BYTES:
-        telegram(token, "sendMessage", data={
-            "chat_id": group_id,
-            "message_thread_id": topic_id,
-            "text": f"Discord media exceeds Telegram's 50 MB bot upload limit: {item.get('filename', 'attachment')}\n{discord_link}",
-            "disable_web_page_preview": True,
-        })
-        print(f"  Shared source link for oversized media ({item.get('filename')})")
-        return
+        raise MediaTooLarge("Media exceeds the hosted Telegram Bot API upload limit")
     media = download_media(item)
     filename = item.get("filename") or "discord-upload"
     mime = (item.get("content_type") or "application/octet-stream").split(";")[0]
@@ -334,26 +443,41 @@ def send_media(token: str, group_id: str, topic_id: str, item: dict, *, discord_
     raise RuntimeError("Telegram did not accept the upload")
 
 
-def process_discord(token: str, guild_id: str, telegram_token: str, group_id: str, state: dict):
+def process_discord(token: str, guild_id: str, telegram_token: str, group_id: str, state: dict, *, overrides=None):
     channels = list_channels(token, guild_id)
     print(f"Found {len(channels)} Discord text/announcement channels")
+    if not channels:
+        raise RuntimeError("No Discord text channels found; check the server ID and bot membership")
     routes = {}
     for ch in channels:
-        target, explanation = match_topic(ch["name"], state["topics"])
+        target, explanation = resolve_channel_route(ch, state["topics"], overrides or {})
         routes[ch["id"]] = target
-        label = state["topics"][target]["name"] if target else "SKIPPED (no safe topic match)"
-        print(f"  #{ch['name']} -> {label} [{explanation}]")
+        label = "matched Telegram topic" if target else "SKIPPED (no safe topic match)"
+        print(f"  {channel_label(ch)} -> {label} [{explanation}]")
+    if not any(routes.values()):
+        raise RuntimeError("No Discord channels match a registered Telegram topic. Send /bind Exact Topic Name inside each matching Telegram topic")
+    processed = 0
+    skipped_oversized = 0
     for ch in channels:
         cid = ch["id"]
         route = routes[cid]
+        if route is None:
+            # Preserve an existing cursor so a temporary rename/unbind does not
+            # discard media that should be delivered after the route is fixed.
+            continue
         cursor = state["channels"].get(cid)
         try:
-            process_channel(token, telegram_token, group_id, state, ch, route, cursor)
+            skipped_oversized += process_channel(token, telegram_token, group_id, state, ch, route, cursor) or 0
+            processed += 1
         except requests.HTTPError as exc:
             if exc.response is not None and exc.response.status_code in (403, 404):
-                print(f"  Skipped #{ch['name']}: Discord bot cannot access this channel")
+                print(f"  Skipped {channel_label(ch)}: Discord bot cannot access this channel")
                 continue
             raise
+    if not processed:
+        raise RuntimeError("The Discord bot cannot read any matched channel; allow View Channel and Read Message History")
+    if skipped_oversized:
+        raise RuntimeError(f"Skipped {skipped_oversized} oversized media attachment(s); other media was processed. No links were posted")
     print("All accessible channels processed")
 
 
@@ -366,35 +490,54 @@ def process_channel(token: str, telegram_token: str, group_id: str, state: dict,
             "last_attachment_index": len(media_attachments(latest[0])) if latest else 0,
         }
         save_state(state)
-        print(f"  Initialized #{ch['name']}; old history intentionally skipped")
-        return
+        print(f"  Initialized {channel_label(ch)}; old history intentionally skipped")
+        return 0
     messages = get_new_messages(token, cid, cursor["last_message_id"])
+    skipped_oversized = 0
     for message in messages:
         assets = media_attachments(message)
         start = cursor["last_attachment_index"] if message["id"] == cursor["last_message_id"] else 0
         if route:
             for index in range(start, len(assets)):
-                link = f"https://discord.com/channels/{get_secret('DISCORD_GUILD_ID')}/{cid}/{message['id']}"
-                send_media(telegram_token, group_id, route, assets[index], discord_link=link)
+                try:
+                    send_media(telegram_token, group_id, route, assets[index])
+                except MediaTooLarge:
+                    skipped_oversized += 1
+                    print("::warning::An oversized media file was skipped. No replacement link or text was sent to Telegram")
                 cursor["last_message_id"] = message["id"]
                 cursor["last_attachment_index"] = index + 1
                 save_state(state)
         elif assets and message["id"] != cursor["last_message_id"]:
-            print(f"  Skipped {len(assets)} attachment(s) in #{ch['name']}; no matched topic")
+            print(f"  Skipped {len(assets)} attachment(s) in {channel_label(ch)}; no matched topic")
         cursor["last_message_id"] = message["id"]
         cursor["last_attachment_index"] = len(assets)
         save_state(state)
+    return skipped_oversized
 
 
 def main():
+    required = ("DISCORD_BOT_TOKEN", "DISCORD_GUILD_ID", "TELEGRAM_BOT_TOKEN", "TELEGRAM_GROUP_ID", "TELEGRAM_OWNER_USER_ID")
+    missing = [name for name in required if not os.environ.get(name, "").strip()]
+    if missing:
+        raise RuntimeError("Missing GitHub Actions secrets/configuration: " + ", ".join(missing))
     discord_token = get_secret("DISCORD_BOT_TOKEN")
     guild_id = get_secret("DISCORD_GUILD_ID")
     telegram_token = get_secret("TELEGRAM_BOT_TOKEN")
     group_id = get_secret("TELEGRAM_GROUP_ID")
     owner_id = get_secret("TELEGRAM_OWNER_USER_ID")
     state = load_state()
-    poll_registration_commands(telegram_token, group_id, owner_id, state)
-    process_discord(discord_token, guild_id, telegram_token, group_id, state)
+    config = load_routing_config()
+    for name, current in (("discord_guild_id", guild_id), ("telegram_group_id", group_id)):
+        if name in config and str(config[name]) != current:
+            raise RuntimeError(f"Private routing configuration {name} does not match the connected group")
+    state["topics"].update(config["topics"])
+    try:
+        poll_registration_commands(telegram_token, group_id, owner_id, state)
+        if not state["topics"]:
+            raise RuntimeError("No Telegram topics registered. Send /bind Exact Topic Name inside each destination topic from your configured owner account")
+        process_discord(discord_token, guild_id, telegram_token, group_id, state, overrides=config["channel_overrides"])
+    finally:
+        save_state(state)
 
 
 if __name__ == "__main__":
